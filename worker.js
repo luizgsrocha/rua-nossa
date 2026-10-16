@@ -18,10 +18,10 @@ export default{async fetch(request,env){
   if(!["all","direct","transfers"].includes(mode))return json({error:"Modo inválido"},400);
   let routes,incomplete=false,diagnostics=null;
   const geo=await loadLocalCities(env,request),rnHubEnabled=env.RN_HUB_ENABLED==="1";
-  if(mode==="direct"||maxTransfers===0){const rides=await getDirectRides(origin,key,date,fromBuscaSlug(geo,origin),fromBuscaSlug(geo,key));routes=rides.map(ride=>makeRoute([{from:origin,to:key,fromName:originName,toName:destinationName,ride}]));if(mode==="transfers")routes=[]}
+  if(mode==="direct"||maxTransfers===0){const rides=await getDirectRides(origin,key,date,fromBuscaSlug(geo,origin),fromBuscaSlug(geo,key),Infinity,0,env);routes=rides.map(ride=>makeRoute([{from:origin,to:key,fromName:originName,toName:destinationName,ride}]));if(mode==="transfers")routes=[]}
   else{
    const strategy=classifySearchStrategy(geo,origin,key),hubIndex=rnHubEnabled?await loadRnHubIndex(env,request):null;
-   const search=await findRoutes(origin,key,date,originName,destinationName,minWait,maxWait,maxTransfers,geo,mode!=="transfers",strategy,{rnHubEnabled:rnHubEnabled&&!!hubIndex,hubIndex});
+   const search=await findRoutes(origin,key,date,originName,destinationName,minWait,maxWait,maxTransfers,geo,mode!=="transfers",strategy,{rnHubEnabled:rnHubEnabled&&!!hubIndex,hubIndex,segmentCache:env.RIDES_CACHE});
    routes=search.routes;incomplete=search.incomplete;diagnostics=search.diagnostics;if(mode==="transfers")routes=routes.filter(x=>x.legs.length>1);
   }
   const direct=routes.filter(x=>x.legs.length===1),transfers=routes.filter(x=>x.legs.length>1);
@@ -35,7 +35,7 @@ async function findRoutes(origin,target,date,originName,targetName,minWait,maxWa
  const deadline=Date.now()+300000;
  const diagnostics={algorithm:options.rnHubEnabled?RN_HUB_VERSION:`legacy-${strategy}`,planned:0,completed:0,failed:0,backwardProbes:0,backwardReachable:0,skippedBudget:0,skippedDepthBudget:0,skippedBeam:0,skippedDetour:0,rejectedWait:0,queryLimit:BRG_MAX_QUERIES,selectedHubs:[],queriedPairs:[],skippedPairs:[]};
  const recordSkip=(reason,key)=>{diagnostics[reason]++;if(diagnostics.skippedPairs.length<100)diagnostics.skippedPairs.push({pair:key,reason})};
- const direct=includeDirect?await getDirectRides(origin,target,date,fromBuscaSlug(geo,origin),fromBuscaSlug(geo,target),deadline,options.rnHubEnabled?60:0):[];
+ const direct=includeDirect?await getDirectRides(origin,target,date,fromBuscaSlug(geo,origin),fromBuscaSlug(geo,target),deadline,options.rnHubEnabled?60:0,{RIDES_CACHE:options.segmentCache}):[];
  const routes=direct.map(ride=>makeRoute([{from:origin,to:target,fromName:originName,toName:targetName,ride}]));
  const from=geo.find(c=>c.slug===origin),to=geo.find(c=>c.slug===target);
  if(!from||!to)return{routes,incomplete:false,diagnostics};
@@ -54,7 +54,7 @@ async function findRoutes(origin,target,date,originName,targetName,minWait,maxWa
    if(queries>=BRG_MAX_QUERIES){incomplete=true;recordSkip("skippedBudget",key);return [];}
    queries++;
    let result;
-   try{result=await getDirectRides(a.slug,b.slug,date,a.buscaOnibusSlug||a.slug,b.buscaOnibusSlug||b.slug,deadline,options.rnHubEnabled?60:0);diagnostics.completed++;diagnostics.queriedPairs.push(key)}
+   try{result=await getDirectRides(a.slug,b.slug,date,a.buscaOnibusSlug||a.slug,b.buscaOnibusSlug||b.slug,deadline,options.rnHubEnabled?60:0,{RIDES_CACHE:options.segmentCache});diagnostics.completed++;diagnostics.queriedPairs.push(key)}
    catch(error){if(!["SourceUnavailableError","SearchTimeoutError"].includes(error.name))throw error;incomplete=true;diagnostics.failed++;diagnostics.queriedPairs.push(key+" [failed]");result=[]}
    cache.set(key,result);
    return result;
@@ -240,13 +240,19 @@ async function fetchRidePage(url,options,deadline=Infinity){
  }catch(error){if(controller.signal.aborted)throw searchTimeout();if(error.name==="SearchTimeoutError")throw error;throw sourceUnavailable()}
  finally{clearTimeout(timer)}
 }
-async function getDirectRides(from,to,date,fromBusca=from,toBusca=to,deadline=Infinity,cacheTtl=0){
+const SEGMENT_CACHE_VERSION="v1",SEGMENT_CACHE_TTL=180;
+async function getDirectRides(from,to,date,fromBusca=from,toBusca=to,deadline=Infinity,cacheTtl=0,env={}){
+ const cache=env.RIDES_CACHE,cacheKey="rn:segment:"+SEGMENT_CACHE_VERSION+":"+date+":"+fromBusca+":"+toBusca;
+ if(cache&&typeof cache.get==="function"){
+  try{const value=await cache.get(cacheKey,"json");if(Array.isArray(value))return value}catch{}
+ }
  const [y,m,d]=date.split("-"),sourceUrl="https://www.buscaonibus.com.br/horario/"+fromBusca+"/"+toBusca+"?dt="+d+"%2F"+m+"%2F"+y,r=await fetchRidePage(sourceUrl,{headers:{"Accept":"text/html","Accept-Language":"pt-BR,pt;q=0.9","User-Agent":"Mozilla/5.0 (compatible; RuaNossa/1.0)"},cf:{cacheTtl,cacheEverything:cacheTtl>0}},deadline);
  const html=decode(r.html),rides=[],seen=new Set();
  const add=(departure,arrival,ridePrice,rideUrl)=>{if(!departure||!arrival)return;const key=[departure,arrival,ridePrice||""].join("|");if(seen.has(key))return;seen.add(key);rides.push({departure,arrival,price:ridePrice,url:rideUrl||sourceUrl})};
  for(const match of html.matchAll(/href=["']([^"']+)["']/gi)){try{const href=decode(match[1]),buyUrl=new URL(href,"https://www.buscaonibus.com.br"),isBlaBla=/\/comprar-passagem\/blablacar(?:\/|$)/i.test(buyUrl.pathname),deep=buyUrl.searchParams.get("deep_link"),validDeep=deep&&/^https:\/\/(www\.)?blablacar\.com\.br\/trip(?:\?|\/)/i.test(deep);if(!isBlaBla&&!validDeep)continue;add(buyUrl.searchParams.get("departure"),buyUrl.searchParams.get("arrival"),buyUrl.searchParams.get("price"),validDeep?deep:buyUrl.href)}catch{}}
  const text=html.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi," ").replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi," ").replace(/<[^>]+>/g," ").replace(/&nbsp;|&#160;/gi," ").replace(/\s+/g," ");
  for(const section of text.split(/Caronas oferecidas pela BlaBlaCar/i).slice(1)){const block=section.split(/(?:Caronas oferecidas pela BlaBlaCar|Assentos livres|Ofertas de Carona\d*|Escolha um dos nossos parceiros)/i)[0];for(const m of block.matchAll(/(\d{1,2}:\d{2})\s+(\d{1,2}:\d{2})\s+R\$\s*([\d.,]+)\s+Reservar/gi))add(m[1],m[2],m[3].replace(".","").replace(",","."),sourceUrl)}
+ if(cache&&typeof cache.put==="function")try{await cache.put(cacheKey,JSON.stringify(rides),{expirationTtl:SEGMENT_CACHE_TTL})}catch{}
  return rides
 }
 async function getRides(from,to,date,fromBusca=from,toBusca=to,deadline=Infinity){const [y,m,d]=date.split("-"),url="https://www.buscaonibus.com.br/horario/"+fromBusca+"/"+toBusca+"?dt="+d+"%2F"+m+"%2F"+y,r=await fetchRidePage(url,{headers:{"Accept":"text/html","Accept-Language":"pt-BR,pt;q=0.9","User-Agent":"Mozilla/5.0 (compatible; RuaNossa/1.0)"},cf:{cacheTtl:0}},deadline);const html=decode(r.html),rides=[],seen=new Set();for(const match of html.matchAll(/href=["']([^"']*deep_link=[^"']+)["']/gi)){try{const href=decode(match[1]),buyUrl=new URL(href,"https://www.buscaonibus.com.br"),deep=buyUrl.searchParams.get("deep_link");if(!deep||!/^https:\/\/(www\.)?blablacar\.com\.br\/trip(?:\?|\/)/i.test(deep)||seen.has(deep))continue;seen.add(deep);rides.push({departure:buyUrl.searchParams.get("departure"),arrival:buyUrl.searchParams.get("arrival"),price:buyUrl.searchParams.get("price"),url:deep})}catch{}}return rides}

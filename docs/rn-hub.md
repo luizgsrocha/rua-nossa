@@ -49,7 +49,19 @@ O corredor é dividido em quatro partes. Cada parte reserva espaço para um cand
 
 Com a flag ativa, até seis consultas partem dos hubs mais próximos do destino para trás. Os resultados entram no mesmo cache da busca para priorizar ramos com um último trecho real. O beam avança da origem e pode montar múltiplas etapas, sempre limitado a `maxTransfers + 1` trechos.
 
-Uma conexão só é retornada quando todos os trechos têm oferta extraída da fonte e os horários respeitam a janela escolhida. Cidades candidatas sem oferta nunca aparecem como carona. Respostas bem-sucedidas do provedor usam cache de 60 segundos durante o experimento; o cache local da requisição evita consultas duplicadas.
+Uma conexão só é retornada quando todos os trechos têm oferta extraída da fonte e os horários respeitam a janela escolhida. Cidades candidatas sem oferta nunca aparecem como carona. `RIDES_CACHE` armazena respostas extraídas por trecho, sentido, data e versão do formato por 180 segundos. Respostas vazias bem-sucedidas também são reutilizadas; falhas e timeouts não são gravados. O cache local da busca continua evitando chamadas duplicadas dentro da mesma requisição. Se o binding KV estiver ausente ou indisponível, o Worker segue consultando a fonte e preserva o comportamento anterior.
+
+O namespace KV é declarado em `wrangler.toml` sem ID explícito para usar o provisionamento de recurso do Wrangler no deploy. O teste `--dry-run` valida o binding, mas não cria ou altera recursos na conta. As buscas em produção só usarão o cache quando o Worker for implantado com esse binding.
+
+### Cache por trecho — benchmark reproduzível
+
+Execute a comparação de cache frio e aquecido com a fonte simulada:
+
+```sh
+node scripts/benchmark-segment-cache.mjs
+```
+
+O script alterna Taubaté → Uberlândia e São Paulo → Uberlândia, mede latência do Worker, quantidade real de fetches externos, respostas de erro e buscas incompletas. A fonte simulada adiciona 18 ms por chamada; nenhum provedor ao vivo é consultado. Os resultados medidos deste PR estão em [reports/segment-cache.md](reports/segment-cache.md). Cache KV simulado verifica a lógica, mas não estima latência de leitura do KV distribuído nem substitui teste após binding em ambiente implantado.
 
 A espera máxima padrão é 720 minutos, ainda editável nas opções avançadas. O padrão anterior de 90 minutos ocultava conexões nacionais reais — por exemplo, Taubaté → Guarulhos → Uberlândia — antes que o passageiro percebesse que o filtro era a causa. Qualquer valor menor escolhido manualmente continua sendo respeitado rigorosamente.
 
